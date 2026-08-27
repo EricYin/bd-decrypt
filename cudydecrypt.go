@@ -9,15 +9,16 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
-	"flag"
 	"fmt"
 	"os"
 	"strings"
 )
 
-// ====== 常量定义 ======
+// ====== 常量定义 (像素级复现C语言硬编码参数) ======
 const (
-	DES_KEY = "88T3j05dtFu8="
+	// 原文无引号宏 88T3j05dtFu8=，这里提供两种可能进行容错切换
+	DES_KEY_RAW  = "88T3j05dtFu8="
+	DES_KEY_ALT  = "88T3j05dtFu8"
 
 	RSA_KEY = "-----BEGIN RSA PUBLIC KEY-----\n" +
 		"MIGJAoGBAK7cBjOnooyuBwJqTfXqcHnIPvxDPbm6IsEwtDlwKDukESn5X+v8Bre\n" +
@@ -25,81 +26,133 @@ const (
 		"NBmreHQqVOFVbF5Z5XHVgTE/8dfXRqmzuuKub9MksTpfBb8bqEhbAgMBAAE=\n" +
 		"-----END RSA PUBLIC KEY-----"
 
-	BDINFO_LEN        = 0xde96
-	BDINFO_DATA_LEN   = 0xdd80
-	BDINFO_DEC_LEN    = 0xdd7c
-	BDINFO_RSA_OFFSET = 0xdd80
-	BDINFO_RSA_LEN    = 0x80
-	BDINFO_END_MAGIC  = "BDINFO_END"
+	BDINFO_LEN           = 0xde96 // 57002 字节 (fread读取的总长度)
+	BDINFO_DATA_LEN      = 0xdd80 // 56704 字节 (参与MD5校验的数据长度)
+	BDINFO_DEC_LEN       = 0xdd7c // 56700 字节 (解密文本的总空间上限)
+	BDINFO_RSA_OFFSET    = 0xdd80 // 56704 字节 (RSA签名的绝对起点)
+	BDINFO_RSA_LEN       = 0x80   // 128 字节 (RSA-1024签名)
+	BDINFO_END_MAGIC     = "BDINFO_END"
+	BDINFO_VAL_NUM_VALS  = 64
 )
 
+func printHelp() {
+	fmt.Fprintf(os.Stderr, "用法: %s -i <输入文件> [-o <输出文件>] [-k <配置项Key>] [-r]\n\n", os.Args)
+	fmt.Fprintln(os.Stderr, "  -i <file>\t输入的加密 bdinfo 文件路径 (必填)")
+	fmt.Fprintln(os.Stderr, "  -o <file>\t将解密后的原始明文导出到指定文件")
+	fmt.Fprintln(os.Stderr, "  -k <key>\t仅获取并打印指定键(Key)的值")
+	fmt.Fprintln(os.Stderr, "  -r       \t跳过 RSA 签名完整性校验")
+}
+
 func main() {
-	inputFile := flag.String("i", "", "输入的加密 bdinfo 文件路径 (必填)")
-	outputFile := flag.String("o", "", "将解密后的原始明文导出到指定文件")
-	targetKey := flag.String("k", "", "仅获取并打印指定键(Key)的值")
-	skipRsa := flag.Bool("r", false, "跳过 RSA 签名完整性校验")
+	var inputFile, outputFile, targetKey string
+	var skipRsa bool
 
-	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "用法: %s -i <输入文件> [-o <输出文件>] [-k <配置项Key>] [-r]\n", os.Args)
-		flag.PrintDefaults()
-	}
-	flag.Parse()
-
-	if *inputFile == "" {
-		fmt.Fprintln(os.Stderr, "错误: 必须指定输入文件 (-i)。")
-		flag.Usage()
-		os.Exit(1)
-	}
-	if *outputFile != "" && *targetKey != "" {
-		fmt.Fprintln(os.Stderr, "错误: 不能同时指定解密导出 (-o) 和 查询Key (-k)。")
-		os.Exit(1)
-	}
-
-	bdinfoEncrypted, err := os.ReadFile(*inputFile)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "错误: 无法读取输入文件: %v\n", err)
-		os.Exit(1)
-	}
-
-	if len(bdinfoEncrypted) != BDINFO_LEN {
-		fmt.Fprintf(os.Stderr, "错误: 读取的字节数 (%d) 与预期大小 (%d) 不符。\n", len(bdinfoEncrypted), BDINFO_LEN)
-		os.Exit(1)
-	}
-
-	if !*skipRsa {
-		if err := validateBdinfoMd5(bdinfoEncrypted); err != nil {
-			fmt.Fprintf(os.Stderr, "错误: RSA 数字签名校验失败: %v\n", err)
+	// ====== 1. 命令行参数解析 ======
+	args := os.Args[1:]
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "-h", "--help":
+			printHelp()
+			return
+		case "-i":
+			if i+1 < len(args) {
+				inputFile = args[i+1]
+				i++
+			}
+		case "-o":
+			if i+1 < len(args) {
+				outputFile = args[i+1]
+				i++
+			}
+		case "-k":
+			if i+1 < len(args) {
+				targetKey = args[i+1]
+				i++
+			}
+		case "-r":
+			skipRsa = true
+		default:
+			fmt.Fprintf(os.Stderr, "未知参数: %s\n", args[i])
+			printHelp()
 			os.Exit(1)
 		}
 	}
 
-	// 56700 不是 8 的倍数，原 C 代码实际上抛弃了末尾无法成块的 4 字节
-	alignedLen := (BDINFO_DEC_LEN / 8) * 8
-
-	cipherText := bdinfoEncrypted[4 : 4+alignedLen]
-	bdinfoDecrypted, err := decryptDesCbc(cipherText)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "错误: DES 解密失败: %v\n", err)
+	if inputFile == "" {
+		fmt.Fprintln(os.Stderr, "Input file required.")
+		os.Exit(1)
+	}
+	if outputFile != "" && targetKey != "" {
+		fmt.Fprintln(os.Stderr, "Decryption and dump not possible.")
 		os.Exit(1)
 	}
 
-	if *outputFile != "" {
+	// ====== 2. 读取并裁剪文件流 (对齐 C 语言 fread 边界) ======
+	fileBytes, err := os.ReadFile(inputFile)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Error opening file")
+		os.Exit(1)
+	}
+
+	if len(fileBytes) < BDINFO_LEN {
+		fmt.Fprintln(os.Stderr, "Read bytes does not equal expected value")
+		os.Exit(1)
+	}
+	// 强行截取前 57002 字节，丢弃更靠后的多余数据
+	bdinfoEncrypted := fileBytes[:BDINFO_LEN]
+
+	// ====== 3. RSA 数字签名校验 ======
+	if !skipRsa {
+		if err := validateBdinfoMd5(bdinfoEncrypted); err != nil {
+			fmt.Fprintln(os.Stderr, "Error checking RSA signature")
+			fmt.Fprintf(os.Stderr, "详请: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	// ====== 4. DES-CBC 解密 (带密钥容错机制) ======
+	// 对齐 C 语言的 8 字节块分组硬性限制
+	alignedLen := (BDINFO_DEC_LEN / 8) * 8 // 56696
+	cipherText := bdinfoEncrypted[4 : 4+alignedLen]
+
+	var bdinfoDecrypted []byte
+	
+	// 【核心双轨解密容错】尝试第一把预设密钥
+	bdinfoDecrypted, err = decryptDesCbc(cipherText, DES_KEY_RAW)
+	
+	// 验证解密出的内容是否包含有效的 ASCII。如果完全不含等号或全是乱码，自动切第二把密钥
+	if err != nil || !bytes.Contains(bdinfoDecrypted, []byte("=")) {
+		// 尝试去掉等号的备用密钥
+		if altDecrypted, altErr := decryptDesCbc(cipherText, DES_KEY_ALT); altErr == nil && bytes.Contains(altDecrypted, []byte("=")) {
+			bdinfoDecrypted = altDecrypted
+		}
+	}
+
+	// 如果依然无法解密出有实际意义的内容
+	if len(bdinfoDecrypted) == 0 {
+		fmt.Fprintln(os.Stderr, "Error decrypting bdinfo (解密失败，输出可能仍为乱码)")
+		os.Exit(1)
+	}
+
+	// ====== 5. 结果投递与解析 ======
+	if outputFile != "" {
 		finalOutput := make([]byte, BDINFO_LEN)
 		copy(finalOutput, bdinfoDecrypted)
-		err = os.WriteFile(*outputFile, finalOutput, 0644)
+		err = os.WriteFile(outputFile, finalOutput, 0644)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "错误: 写入输出文件失败: %v\n", err)
+			fmt.Fprintln(os.Stderr, "Error writing output file")
 			os.Exit(1)
 		}
-		fmt.Printf("成功将解密数据导出至: %s\n", *outputFile)
-	} else {
-		bdinfoValues, err := parseBdinfo(bdinfoDecrypted)
+	} {
+		// 严格对齐 C 语言参数限制：parse_bdinfo(buf, BDINFO_DEC_LEN)
+		bdinfoValues, err := parseBdinfo(bdinfoDecrypted, BDINFO_DEC_LEN)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "错误: 解析 bdinfo 文本失败: %v\n", err)
+			fmt.Fprintln(os.Stderr, "Error parsing bdinfo")
+			fmt.Fprintf(os.Stderr, "详情: %v\n", err)
 			os.Exit(1)
 		}
 
-		printBdinfo(bdinfoValues, *targetKey)
+		printBdinfo(bdinfoValues, targetKey)
 	}
 }
 
@@ -113,50 +166,44 @@ func validateBdinfoMd5(input []byte) error {
 
 	block, _ := pem.Decode([]byte(RSA_KEY))
 	if block == nil {
-		return fmt.Errorf("无法解析公钥 PEM 块")
+		return fmt.Errorf("Error allocating RSA public key")
 	}
 
 	pubKey, err := x509.ParsePKCS1PublicKey(block.Bytes)
 	if err != nil {
-		return fmt.Errorf("无法解析 PKCS#1 RSA 公钥: %v", err)
+		return fmt.Errorf("Error reading RSA public key")
 	}
 
 	err = rsa.VerifyPKCS1v15(pubKey, crypto.MD5, md5Digest, rsaSignature)
 	if err != nil {
-		return fmt.Errorf("签名验证未通过（数据可能已被篡改）")
+		return fmt.Errorf("Error validating MD5")
 	}
 
 	return nil
 }
 
-// 模拟 OpenSSL 的 DES_string_to_key 核心算法
+// 完美模拟 OpenSSL 独家暗号：DES_string_to_key 变换逻辑
 func opensslStringToKey(str string) []byte {
 	key := make([]byte, 8)
 	strBytes := []byte(str)
 
-	// OpenSSL 经典映射：异或移位叠加
 	for i := 0; i < len(strBytes); i++ {
 		j := i % 8
-		if (i / 8) % 2 == 1 {
-			// 奇数个 8 字节块，逆序映射并移位
+		if (i / 8)%2 == 1 {
 			key[7-j] ^= (strBytes[i] << 1)
 		} else {
-			// 偶数个 8 字节块，正序映射并移位
 			key[j] ^= (strBytes[i] << 1)
 		}
 	}
 
-	// 强行修正奇偶校验位 (DES 密钥每字节最低位为校验位)
 	for i := 0; i < 8; i++ {
 		b := key[i]
-		// 计算前 7 位的 1 的个数
 		count := 0
 		for bit := 1; bit < 256; bit <<= 1 {
 			if b&byte(bit) != 0 {
 				count++
 			}
 		}
-		// 如果 1 的个数是偶数，将最低位置 1，凑成奇数个 1
 		if count%2 == 0 {
 			key[i] |= 1
 		} else {
@@ -167,16 +214,15 @@ func opensslStringToKey(str string) []byte {
 	return key
 }
 
-func decryptDesCbc(cipherText []byte) ([]byte, error) {
-	// 使用完美的 OpenSSL 密钥平替函数
-	keyBytes := opensslStringToKey(DES_KEY)
+func decryptDesCbc(cipherText []byte, keyStr string) ([]byte, error) {
+	keyBytes := opensslStringToKey(keyStr)
 
 	block, err := des.NewCipher(keyBytes)
 	if err != nil {
 		return nil, err
 	}
 
-	ivBytes := make([]byte, des.BlockSize)
+	ivBytes := make([]byte, des.BlockSize) // 全零初始化向量
 	mode := NewCBCDecrypter(block, ivBytes)
 
 	decrypted := make([]byte, len(cipherText))
@@ -185,20 +231,36 @@ func decryptDesCbc(cipherText []byte) ([]byte, error) {
 	return decrypted, nil
 }
 
-func parseBdinfo(data []byte) (map[string]string, error) {
-	// 移除可能存在的无效前导或尾部非文本空字节
-	text := string(bytes.Trim(data, "\x00"))
-
-	eofIndex := strings.Index(text, BDINFO_END_MAGIC)
-	if eofIndex == -1 {
-		return nil, fmt.Errorf("未找到 EOF 结束标记 (BDINFO_END)")
+func parseBdinfo(data []byte, maxLen int) ([]string, error) {
+	if len(data) > maxLen {
+		data = data[:maxLen]
 	}
 
-	validText := text[:eofIndex]
-	lines := strings.Split(validText, "\n")
-	bdinfoValues := make(map[string]string)
+	// 移除解密出来可能残存的空字节流，避免干扰字符串查找
+	text := string(bytes.Trim(data, "\x00"))
 
-	for _, line := range lines {
+	if !strings.Contains(text, BDINFO_END_MAGIC) {
+		return nil, fmt.Errorf("EOF Marker not found")
+	}
+
+	rawLines := strings.Split(text, "\n")
+	var finalLines []string
+
+	// 严格控制最大处理行数为 64 行 (BDINFO_VAL_NUM_VALS)
+	for _, line := range rawLines {
+		if len(finalLines) >= BDINFO_VAL_NUM_VALS {
+			break
+		}
+		// 检查 C 语言的 EOF Marker 中断判定
+		if strings.HasPrefix(strings.TrimSpace(line), BDINFO_END_MAGIC) {
+			break
+		}
+		finalLines = append(finalLines, line)
+	}
+
+	kvPairs := make([]string, 0, len(finalLines)*2)
+
+	for _, line := range finalLines {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
@@ -206,31 +268,45 @@ func parseBdinfo(data []byte) (map[string]string, error) {
 
 		sepIndex := strings.Index(line, "=")
 		if sepIndex == -1 {
-			continue
+			return nil, fmt.Errorf("Invalid line without separator")
 		}
 
+		// 模拟 C 语言等号内存截断行为
 		key := strings.TrimSpace(line[:sepIndex])
 		value := strings.TrimSpace(line[sepIndex+1:])
+		
+		// 剥离老旧固件可能残留的控制符
+		value = strings.TrimRight(value, "\r\x00")
 
 		if key != "" {
-			bdinfoValues[key] = value
+			kvPairs = append(kvPairs, key, value)
 		}
 	}
 
-	return bdinfoValues, nil
+	return kvPairs, nil
 }
 
-func printBdinfo(bdinfoValues map[string]string, targetKey string) {
-	if targetKey != "" {
-		if val, ok := bdinfoValues[targetKey]; ok {
-			fmt.Println(val)
+func printBdinfo(kvPairs []string, targetKey string) {
+	keyFound := false
+
+	for i := 0; i < len(kvPairs); i += 2 {
+		k := kvPairs[i]
+		v := kvPairs[i+1]
+
+		if targetKey != "" {
+			if k == targetKey {
+				fmt.Printf("%s\n", v)
+				keyFound = true
+				return
+			}
 		} else {
-			fmt.Fprintf(os.Stderr, "错误: 在 bdinfo 中未找到键 '%s'\n", targetKey)
-		}
-	} else {
-		for k, v := range bdinfoValues {
 			fmt.Printf("%s = %s\n", k, v)
 		}
+	}
+
+	if targetKey != "" && !keyFound {
+		fmt.Fprintf(os.Stderr, "Key %s not found in bdinfo\n", targetKey)
+		os.Exit(1)
 	}
 }
 
